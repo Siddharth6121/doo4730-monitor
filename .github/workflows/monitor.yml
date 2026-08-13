@@ -26,11 +26,26 @@ jobs:
         run: pip install --quiet -r requirements.txt
 
       - name: Run detector
+        id: detect
         env:
           INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
           INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
           INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
         run: python check_once.py
+
+      - name: Email alert on confirmed failure
+        if: steps.detect.outputs.new_failures != '' && steps.detect.outputs.new_failures != '0'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚨 DOO4730 — tool failure detected"
+          to: ${{ secrets.ALERT_TO }}
+          from: DOO4730 Monitor <${{ secrets.SMTP_USERNAME }}>
+          body: ${{ steps.detect.outputs.summary }}
 
       - name: Commit any new detections
         run: |

@@ -44,6 +44,16 @@ def append_rows(rows):
             w.writerow(r)
 
 
+def set_output(name, value):
+    """Expose a value to later GitHub Actions steps (multiline-safe)."""
+    go = os.environ.get("GITHUB_OUTPUT")
+    if not go:
+        return
+    delim = f"__EOF_{name}__"
+    with open(go, "a") as f:
+        f.write(f"{name}<<{delim}\n{value}\n{delim}\n")
+
+
 def main():
     now = datetime.utcnow().isoformat()
     c = get_client()
@@ -105,9 +115,16 @@ def main():
         print(f"{now}Z  🚨 {len(new_rows)} NEW confirmed detection(s) recorded:")
         for r in new_rows:
             print("   ", r)
+        lines = [f"- {r[4]} at {r[2]} UTC (peak {r[3]} A)" for r in new_rows]
+        body = ("DOO4730 tool-failure detected on the live feed.\n\n"
+                + "\n".join(lines)
+                + f"\n\nDetected at {now} UTC. Full log: detections.csv in the repo.")
+        set_output("new_failures", str(len(new_rows)))
+        set_output("summary", body)
     else:
         print(f"{now}Z  ok · surge episodes={n_surge} · confirmed failures=0 · "
               f"latest sensor={str(sen['time'].max())[:19]}")
+        set_output("new_failures", "0")
 
 
 if __name__ == "__main__":
