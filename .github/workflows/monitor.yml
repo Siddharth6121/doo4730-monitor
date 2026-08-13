@@ -1,0 +1,45 @@
+name: DOO4730 detection monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # every 5 minutes (GitHub's minimum; may be delayed under load)
+  workflow_dispatch: {}          # allows manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write                # so the job can commit detections.csv back to the repo
+
+concurrency:
+  group: doo4730-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Run detector
+        env:
+          INFLUX_HOST: ${{ secrets.INFLUX_HOST }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_DATABASE: ${{ secrets.INFLUX_DATABASE }}
+        run: python check_once.py
+
+      - name: Commit any new detections
+        run: |
+          git config user.name "doo4730-monitor"
+          git config user.email "actions@users.noreply.github.com"
+          git add detections.csv 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "no new detections to commit"
+          else
+            git commit -m "detection update $(date -u +%FT%TZ)"
+            git push
+          fi
