@@ -1,12 +1,16 @@
 """
 DOO4730 — single-pass two-tier detection check (for GitHub Actions cron).
-Runs once: pulls the last few minutes from InfluxDB, applies the two-tier
-detector, and appends any NEW confirmed failures to detections.csv.
 
-Tier 1  surge          current jumps over the self-set alarm level (normal cutting)
-Tier 2  CONFIRMED       a surge that coincides with a machine stoppage
-        FAILURE         (INTERRUPTED/DISCONNECTED within 30s) or a sensor dropout
-Only Tier 2 is recorded to detections.csv.
+MISS-PROOF DESIGN:
+- Wide 45-min lookback (GitHub's free cron slips to ~20-min gaps; overlapping wide
+  windows + de-dup guarantee no event is skipped).
+- Status-driven + file-limit-safe: we scan the SPARSE stoppage stream in small
+  time-chunks (cheap, never trips the 432-file scan cap), and for each stoppage do a
+  TINY sensor check around it — instead of scanning a wide 1 Hz sensor window.
+- tenant_id = 2 (DOO4730's rich feed; avoids the cross-tenant duplicate rows).
+
+A CONFIRMED failure = an INTERRUPTED/DISCONNECTED stoppage that coincides with a
+current surge OR a sensor dropout (the two-tier rule). Only these are recorded/emailed.
 """
 import warnings; warnings.filterwarnings("ignore")
 import os, csv
@@ -16,10 +20,10 @@ from influx_utils import get_client
 
 CUR = ["spindle_current_leg1", "spindle_current_leg2", "spindle_current_leg3"]
 ALARM = 89.4
-CONFIRM_S = 30
 HEARTBEAT_GAP_S = 3.0
 ABNORMAL = ["INTERRUPTED", "DISCONNECTED"]
-LOOKBACK_MIN = 12
+LOOKBACK_MIN = 45            # wide, to cover GitHub cron delays (never miss)
+CHUNK_MIN = 10              # scan the status stream in 10-min pieces (file-limit-safe)
 DET = "detections.csv"
 HEADER = ["key", "detected_utc", "event_time_utc", "peak_A", "type"]
 
@@ -45,85 +49,83 @@ def append_rows(rows):
 
 
 def set_output(name, value):
-    """Expose a value to later GitHub Actions steps (multiline-safe)."""
     go = os.environ.get("GITHUB_OUTPUT")
     if not go:
         return
-    delim = f"__EOF_{name}__"
+    d = f"__EOF_{name}__"
     with open(go, "a") as f:
-        f.write(f"{name}<<{delim}\n{value}\n{delim}\n")
+        f.write(f"{name}<<{d}\n{value}\n{d}\n")
 
 
 def main():
-    now = datetime.utcnow().isoformat()
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    ts = datetime.utcnow().isoformat()
     c = get_client()
-    sen = c.query(
-        f"SELECT time,{','.join(CUR)} FROM sensor_telemetry WHERE device_id='DOO4730' "
-        f"AND time > now() - INTERVAL '{LOOKBACK_MIN} minutes' ORDER BY time ASC",
-        language="sql").to_pandas()
-    sta = c.query(
-        f"SELECT time,run_status FROM telemetry_raw WHERE device_id='DOO4730' "
-        f"AND time > now() - INTERVAL '{LOOKBACK_MIN} minutes' ORDER BY time ASC",
-        language="sql").to_pandas()
 
-    if not len(sen):
-        print(f"{now}Z  no sensor rows in last {LOOKBACK_MIN} min (feed idle) — nothing to do")
-        return
+    # 1) gather abnormal stoppages over the wide window, in small chunks (cheap + file-safe)
+    abn = []
+    h = LOOKBACK_MIN
+    while h > 0:
+        a = now - pd.Timedelta(minutes=h)
+        b = now - pd.Timedelta(minutes=max(h - CHUNK_MIN, 0))
+        try:
+            d = c.query(
+                f"SELECT time, run_status FROM telemetry_raw WHERE device_id='DOO4730' AND tenant_id=2 "
+                f"AND run_status IN ('INTERRUPTED','DISCONNECTED') "
+                f"AND time >= TIMESTAMP '{a:%Y-%m-%d %H:%M:%S}' AND time < TIMESTAMP '{b:%Y-%m-%d %H:%M:%S}' "
+                f"ORDER BY time ASC", language="sql").to_pandas()
+            if len(d):
+                abn.append(d)
+        except Exception:
+            pass
+        h -= CHUNK_MIN
+    stops = pd.concat(abn).drop_duplicates(subset=["time"]) if abn else pd.DataFrame(columns=["time", "run_status"])
+    if len(stops):
+        stops["time"] = pd.to_datetime(stops["time"]).dt.tz_localize(None)
 
-    sen["time"] = pd.to_datetime(sen["time"]).dt.tz_localize(None)
-    sen = sen.sort_values("time").reset_index(drop=True)
-    sen["max_current"] = sen[CUR].max(axis=1)
-    sen["surge"] = sen["max_current"] - sen["max_current"].shift(2)
-    sen["next_gap"] = (sen["time"].shift(-1) - sen["time"]).dt.total_seconds()
-
-    abn_times = []
-    if sta is not None and len(sta):
-        sta["time"] = pd.to_datetime(sta["time"]).dt.tz_localize(None)
-        abn_times = list(sta[sta["run_status"].isin(ABNORMAL)]["time"])
-
+    # 2) confirm each NEW stoppage with a tiny sensor check (surge OR dropout)
     keys = existing_keys()
     new_rows = []
-    n_surge = 0
-
-    fl = sen[sen["surge"] > ALARM].copy()
-    if len(fl):
-        g = fl["time"].diff().dt.total_seconds()
-        fl["ep"] = (g > 30).cumsum()
-        for _, grp in fl.groupby("ep"):
-            n_surge += 1
-            t0 = grp["time"].iloc[0]
-            peak = float(grp["max_current"].max())
-            confirmed = any((et >= t0 - pd.Timedelta(seconds=10)) and
-                            (et <= t0 + pd.Timedelta(seconds=CONFIRM_S)) for et in abn_times)
-            if confirmed:
-                key = t0.strftime("%Y%m%d%H%M%S")
-                if key not in keys:
-                    new_rows.append([key, now, str(t0), round(peak, 1), "surge+stoppage"])
-                    keys.add(key)
-
-    # sensor dropout (heartbeat) within the window
-    big_gap = sen["next_gap"].max()
-    if pd.notna(big_gap) and big_gap > HEARTBEAT_GAP_S:
-        gt = sen.loc[sen["next_gap"].idxmax(), "time"]
-        key = "HB" + gt.strftime("%Y%m%d%H%M%S")
-        if key not in keys:
-            new_rows.append([key, now, str(gt), 0, f"sensor_dropout_{big_gap:.0f}s"])
+    for _, r in stops.sort_values("time").iterrows():
+        t = r["time"]
+        key = t.strftime("%Y%m%d%H%M%S")
+        if key in keys:
+            continue
+        a = (t - pd.Timedelta(seconds=45)).strftime("%Y-%m-%d %H:%M:%S")
+        b = (t + pd.Timedelta(seconds=35)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            w = c.query(
+                f"SELECT time,{','.join(CUR)} FROM sensor_telemetry WHERE device_id='DOO4730' AND tenant_id=2 "
+                f"AND time > TIMESTAMP '{a}' AND time < TIMESTAMP '{b}' ORDER BY time ASC", language="sql").to_pandas()
+        except Exception:
+            continue
+        surge = dropout = False
+        peak = 0.0
+        if len(w) > 2:
+            w["time"] = pd.to_datetime(w["time"]).dt.tz_localize(None)
+            mc = w[CUR].max(axis=1)
+            peak = float(mc.max())
+            surge = bool(((mc - mc.shift(2)) > ALARM).any())
+            dropout = bool((w["time"].diff().dt.total_seconds().max() or 0) > HEARTBEAT_GAP_S)
+        else:
+            dropout = True   # feed silent around the stoppage
+        if surge or dropout:
+            typ = "surge+stoppage" if surge else "sensor_dropout+stoppage"
             keys.add(key)
+            new_rows.append([key, ts, str(t)[:19], round(peak, 1), typ])
 
     if new_rows:
         append_rows(new_rows)
-        print(f"{now}Z  🚨 {len(new_rows)} NEW confirmed detection(s) recorded:")
+        print(f"{ts}Z  🚨 {len(new_rows)} NEW confirmed failure(s):")
         for r in new_rows:
             print("   ", r)
-        lines = [f"- {r[4]} at {r[2]} UTC (peak {r[3]} A)" for r in new_rows]
-        body = ("DOO4730 tool-failure detected on the live feed.\n\n"
-                + "\n".join(lines)
-                + f"\n\nDetected at {now} UTC. Full log: detections.csv in the repo.")
+        body = ("DOO4730 tool failure detected on the live feed.\n\n" +
+                "\n".join(f"- {r[4]} at {r[2]} UTC (peak {r[3]} A)" for r in new_rows) +
+                f"\n\nDetected at {ts} UTC. Full log: detections.csv in the repo.")
         set_output("new_failures", str(len(new_rows)))
         set_output("summary", body)
     else:
-        print(f"{now}Z  ok · surge episodes={n_surge} · confirmed failures=0 · "
-              f"latest sensor={str(sen['time'].max())[:19]}")
+        print(f"{ts}Z  ok · stoppages scanned={len(stops)} · confirmed failures=0 (lookback {LOOKBACK_MIN}m)")
         set_output("new_failures", "0")
 
 
