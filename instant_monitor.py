@@ -41,9 +41,22 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 ALERT_TO = [x.strip() for x in os.environ.get("ALERT_TO", "").split(",") if x.strip()]
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # Teams/Slack incoming webhook — fastest push
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")   # dead-man's switch (e.g. healthchecks.io) — pings while alive
+FEED_STALE_MIN = int(os.environ.get("FEED_STALE_MIN", "10"))   # alert if no new sensor data for this many minutes
 
 
 def log(m): print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}Z  {m}", flush=True)
+
+
+def ping_health():
+    """Ping the external watchdog to say 'I'm alive'. If these pings stop (crash, VM down,
+    network down), the watchdog service alerts you — no dependence on this box being up."""
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        urllib.request.urlopen(HEALTHCHECK_URL, timeout=5)
+    except Exception:
+        pass
 
 
 def send_email(subject, body):
@@ -152,11 +165,15 @@ def main():
     client = get_client(); client.query("SHOW TABLES", language="sql")
     seen = existing_keys()
     n = 0
+    feed_alerted = False
+    ping_every = max(1, int(30 / POLL_S))   # ping the watchdog ~every 30s
     while True:
         n += 1
         try:
             new, info = poll_once(client, seen)
         except Exception as e:
+            # note: we do NOT ping the watchdog here -> if InfluxDB stays unreachable, the
+            # dead-man's switch fires and alerts you that the monitor is effectively blind.
             log(f"poll error (retrying): {str(e)[:110]}"); time.sleep(POLL_S); continue
         for key, peak, typ in new:
             now = datetime.utcnow().isoformat()
@@ -168,6 +185,30 @@ def main():
                 f"A confirmed tool failure was detected on DOO4730.\n\n"
                 f"Event time (UTC): {key}\nType: {typ}\nPeak current: {peak} A\n"
                 f"Detected at: {now} UTC\n\nRecorded to detections.csv.")
+
+        # --- feed-down alert: monitor is up, but is data still arriving? ---
+        stale = (info == "no-sensor")
+        if not stale:
+            try:
+                age_min = (datetime.utcnow() - datetime.strptime(info, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+                stale = age_min > FEED_STALE_MIN
+            except Exception:
+                stale = False
+        if stale and not feed_alerted:
+            feed_alerted = True
+            log(f"⚠️  SENSOR FEED STALE — no new data for >{FEED_STALE_MIN} min (latest={info})")
+            send_webhook(f"⚠️ DOO4730 monitor: sensor feed STALLED — no new data for >{FEED_STALE_MIN} min (latest {info} UTC)")
+            send_email("⚠️ DOO4730 — sensor feed stalled",
+                       f"No new sensor data for over {FEED_STALE_MIN} minutes (latest reading {info} UTC). "
+                       f"The detector is running but has no live data to watch — please check the feed/ingestion.")
+        elif not stale and feed_alerted:
+            feed_alerted = False
+            log("✓ sensor feed recovered")
+            send_webhook("✓ DOO4730 monitor: sensor feed recovered.")
+
+        # --- dead-man's switch: we reached here => app is alive AND InfluxDB reachable ---
+        if n % ping_every == 0:
+            ping_health()
         if n % HEARTBEAT_EVERY == 0:
             log(f"heartbeat: alive · latest sensor={info} · confirmed-total={len(seen)}")
         time.sleep(POLL_S)
