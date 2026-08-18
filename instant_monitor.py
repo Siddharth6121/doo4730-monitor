@@ -147,14 +147,18 @@ def poll_once(client, seen):
                 if key not in seen:
                     seen.add(key)
                     new.append((key, round(float(grp["mc"].max()), 1), "surge+stoppage"))
-    # heartbeat dropout
+    # dropout — only a FAILURE if the feed gap COINCIDES with a machine stoppage.
+    # (a brief network/comms blip with no stoppage is NOT a tool failure — those are
+    #  common during normal cutting, so requiring a stoppage kills that false positive.
+    #  A prolonged feed loss is still surfaced separately by the feed-stalled alert.)
     bg = sen["gap"].max()
     if pd.notna(bg) and bg > HEARTBEAT_GAP_S:
         gt = sen.loc[sen["gap"].idxmax(), "time"]
-        key = "HB " + str(gt)[:19]
-        if key not in seen:
-            seen.add(key)
-            new.append((str(gt)[:19], 0.0, f"sensor_dropout_{bg:.0f}s"))
+        if any(abs((et - gt).total_seconds()) <= CONFIRM_S for et in abn_times):
+            key = "HB " + str(gt)[:19]
+            if key not in seen:
+                seen.add(key)
+                new.append((str(gt)[:19], 0.0, f"sensor_dropout+stoppage_{bg:.0f}s"))
     latest = str(sen["time"].max())[:19]
     return new, latest
 
