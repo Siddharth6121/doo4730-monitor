@@ -43,6 +43,7 @@ ALERT_TO = [x.strip() for x in os.environ.get("ALERT_TO", "").split(",") if x.st
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # Teams/Slack incoming webhook — fastest push
 HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")   # dead-man's switch (e.g. healthchecks.io) — pings while alive
 FEED_STALE_MIN = int(os.environ.get("FEED_STALE_MIN", "10"))   # alert if no new sensor data for this many minutes
+ALERT_COOLDOWN_S = int(os.environ.get("ALERT_COOLDOWN_S", "300"))   # min seconds between alert emails (anti-storm)
 
 
 def log(m): print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}Z  {m}", flush=True)
@@ -135,15 +136,19 @@ def poll_once(client, seen):
         abn_times = list(sta[sta["run_status"].isin(ABNORMAL)]["time"])
 
     new = []
-    # Tier-2: surge episodes confirmed by a nearby stoppage
+    # Tier-2: a failure = a machine STOPPAGE with a nearby current surge.
+    # Key by the STOPPAGE (not each surge) so a burst of surges around one stoppage is
+    # ONE failure -> one alert. (Prevents the email storm from a single incident.)
     fl = sen[sen["surge"] > ALARM]
     if len(fl):
         g = fl["time"].diff().dt.total_seconds()
         fl = fl.assign(ep=(g > 30).cumsum())
         for _, grp in fl.groupby("ep"):
             t0 = grp["time"].iloc[0]
-            if any((et >= t0 - pd.Timedelta(seconds=10)) and (et <= t0 + pd.Timedelta(seconds=CONFIRM_S)) for et in abn_times):
-                key = str(t0)[:19]
+            conf_stop = next((et for et in abn_times
+                              if (et >= t0 - pd.Timedelta(seconds=10)) and (et <= t0 + pd.Timedelta(seconds=CONFIRM_S))), None)
+            if conf_stop is not None:
+                key = str(conf_stop)[:19]           # one failure per stoppage
                 if key not in seen:
                     seen.add(key)
                     new.append((key, round(float(grp["mc"].max()), 1), "surge+stoppage"))
@@ -154,11 +159,12 @@ def poll_once(client, seen):
     bg = sen["gap"].max()
     if pd.notna(bg) and bg > HEARTBEAT_GAP_S:
         gt = sen.loc[sen["gap"].idxmax(), "time"]
-        if any(abs((et - gt).total_seconds()) <= CONFIRM_S for et in abn_times):
-            key = "HB " + str(gt)[:19]
+        conf_stop = next((et for et in abn_times if abs((et - gt).total_seconds()) <= CONFIRM_S), None)
+        if conf_stop is not None:
+            key = str(conf_stop)[:19]               # one failure per stoppage
             if key not in seen:
                 seen.add(key)
-                new.append((str(gt)[:19], 0.0, f"sensor_dropout+stoppage_{bg:.0f}s"))
+                new.append((key, 0.0, f"sensor_dropout+stoppage_{bg:.0f}s"))
     latest = str(sen["time"].max())[:19]
     return new, latest
 
@@ -170,6 +176,7 @@ def main():
     seen = existing_keys()
     n = 0
     feed_alerted = False
+    last_alert = None                        # for the anti-storm alert cooldown
     ping_every = max(1, int(30 / POLL_S))   # ping the watchdog ~every 30s
     while True:
         n += 1
@@ -183,12 +190,19 @@ def main():
             now = datetime.utcnow().isoformat()
             append_det([now, key, peak, typ])
             log(f"🚨 CONFIRMED FAILURE  event={key} UTC  peak={peak}A  type={typ}")
-            send_webhook(f"🚨 DOO4730 tool failure — event {key} UTC, {typ}, peak {peak} A (detected {now} UTC)")
-            send_email(
-                "🚨 DOO4730 — tool failure detected",
-                f"A confirmed tool failure was detected on DOO4730.\n\n"
-                f"Event time (UTC): {key}\nType: {typ}\nPeak current: {peak} A\n"
-                f"Detected at: {now} UTC\n\nRecorded to detections.csv.")
+            # cooldown: still LOG every confirmed failure, but don't email/webhook more
+            # than once per ALERT_COOLDOWN_S (belt-and-suspenders against alert storms)
+            nowdt = datetime.utcnow()
+            if last_alert is None or (nowdt - last_alert).total_seconds() > ALERT_COOLDOWN_S:
+                send_webhook(f"🚨 DOO4730 tool failure — event {key} UTC, {typ}, peak {peak} A (detected {now} UTC)")
+                send_email(
+                    "🚨 DOO4730 — tool failure detected",
+                    f"A confirmed tool failure was detected on DOO4730.\n\n"
+                    f"Event time (UTC): {key}\nType: {typ}\nPeak current: {peak} A\n"
+                    f"Detected at: {now} UTC\n\nRecorded to detections.csv.")
+                last_alert = nowdt
+            else:
+                log(f"   (alert suppressed by {ALERT_COOLDOWN_S}s cooldown — logged only)")
 
         # --- feed-down alert: monitor is up, but is data still arriving? ---
         stale = (info == "no-sensor")
