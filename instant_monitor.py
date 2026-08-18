@@ -136,35 +136,26 @@ def poll_once(client, seen):
         abn_times = list(sta[sta["run_status"].isin(ABNORMAL)]["time"])
 
     new = []
-    # Tier-2: a failure = a machine STOPPAGE with a nearby current surge.
-    # Key by the STOPPAGE (not each surge) so a burst of surges around one stoppage is
-    # ONE failure -> one alert. (Prevents the email storm from a single incident.)
-    fl = sen[sen["surge"] > ALARM]
-    if len(fl):
-        g = fl["time"].diff().dt.total_seconds()
-        fl = fl.assign(ep=(g > 30).cumsum())
-        for _, grp in fl.groupby("ep"):
-            t0 = grp["time"].iloc[0]
-            conf_stop = next((et for et in abn_times
-                              if (et >= t0 - pd.Timedelta(seconds=10)) and (et <= t0 + pd.Timedelta(seconds=CONFIRM_S))), None)
-            if conf_stop is not None:
-                key = str(conf_stop)[:19]           # one failure per stoppage
-                if key not in seen:
-                    seen.add(key)
-                    new.append((key, round(float(grp["mc"].max()), 1), "surge+stoppage"))
-    # dropout — only a FAILURE if the feed gap COINCIDES with a machine stoppage.
-    # (a brief network/comms blip with no stoppage is NOT a tool failure — those are
-    #  common during normal cutting, so requiring a stoppage kills that false positive.
-    #  A prolonged feed loss is still surfaced separately by the feed-stalled alert.)
-    bg = sen["gap"].max()
-    if pd.notna(bg) and bg > HEARTBEAT_GAP_S:
-        gt = sen.loc[sen["gap"].idxmax(), "time"]
-        conf_stop = next((et for et in abn_times if abs((et - gt).total_seconds()) <= CONFIRM_S), None)
-        if conf_stop is not None:
-            key = str(conf_stop)[:19]               # one failure per stoppage
-            if key not in seen:
-                seen.add(key)
-                new.append((key, 0.0, f"sensor_dropout+stoppage_{bg:.0f}s"))
+    # Tier-2: a failure = a machine STOPPAGE (INTERRUPTED/DISCONNECTED) that coincides with
+    # a current surge (or a sensor dropout). We DRIVE OFF THE STOPPAGE so we confirm the
+    # instant it lands (~2-4s, near-instant even during heavy cutting) and key by it, so a
+    # burst of surges around one incident = ONE alert. The stoppage is required, so normal
+    # cutting (surges but no stoppage) never fires -> no extra false positives.
+    for st in abn_times:
+        key = str(st)[:19]
+        if key in seen:
+            continue
+        w = sen[(sen["time"] >= st - pd.Timedelta(seconds=CONFIRM_S)) & (sen["time"] <= st + pd.Timedelta(seconds=10))]
+        surge = bool(len(w) and (w["surge"] > ALARM).any())
+        w2 = sen[(sen["time"] >= st - pd.Timedelta(seconds=CONFIRM_S)) & (sen["time"] <= st + pd.Timedelta(seconds=CONFIRM_S))]
+        gapmax = w2["gap"].max() if len(w2) else 0
+        dropout = bool(pd.notna(gapmax) and gapmax > HEARTBEAT_GAP_S)
+        if surge:
+            seen.add(key)
+            new.append((key, round(float(w["mc"].max()), 1), "surge+stoppage"))
+        elif dropout:
+            seen.add(key)
+            new.append((key, 0.0, f"sensor_dropout+stoppage_{gapmax:.0f}s"))
     latest = str(sen["time"].max())[:19]
     return new, latest
 
